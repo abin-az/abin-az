@@ -26,12 +26,17 @@
     Disabled by default to avoid deleting app-expected folder structures.
 .PARAMETER LogPath
     Optional path for an audit log containing deleted and skipped entries.
+.PARAMETER MonitoringOutputPath
+    Optional JSON output path for monitoring integrations (SCOM/LogicMonitor/etc.).
+    Contains a small status payload including whether a reboot is required.
 .EXAMPLE
     .\DiskCleanup.ps1 -AutoMode -Days 7
 .EXAMPLE
     .\DiskCleanup.ps1 -AutoMode -Days 30 -SkipDism
 .EXAMPLE
     .\DiskCleanup.ps1 -WhatIf
+.EXAMPLE
+    .\DiskCleanup.ps1 -AutoMode -MonitoringOutputPath "C:\Logs\DiskCleanup.status.json"
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -48,7 +53,9 @@ param(
 
     [switch]$RemoveEmptyDirs,
 
-    [string]$LogPath
+    [string]$LogPath,
+
+    [string]$MonitoringOutputPath
 )
 
 Set-StrictMode -Version Latest
@@ -81,6 +88,39 @@ function Flush-Log {
     }
     catch {
         Write-Host "Could not write log to $LogPath : $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
+
+function Write-MonitoringStatus {
+    param(
+        [bool]$RebootRequired,
+        [Nullable[int]]$DismExitCode
+    )
+
+    if ([string]::IsNullOrWhiteSpace($MonitoringOutputPath)) {
+        return
+    }
+
+    try {
+        $folder = Split-Path -Path $MonitoringOutputPath -Parent
+        if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) {
+            New-Item -Path $folder -ItemType Directory -Force | Out-Null
+        }
+
+        $payload = [pscustomobject]@{
+            TimestampUtc      = (Get-Date).ToUniversalTime().ToString('o')
+            RebootRequired    = $RebootRequired
+            DismExitCode      = $DismExitCode
+            MaintenanceStatus = if ($RebootRequired) { 'MaintenanceRequired' } else { 'Healthy' }
+        }
+
+        $payload | ConvertTo-Json -Depth 3 | Out-File -LiteralPath $MonitoringOutputPath -Encoding UTF8
+        Write-Host "Monitoring status written to: $MonitoringOutputPath" -ForegroundColor DarkGray
+        Write-Log "MONITOR payload written: $MonitoringOutputPath"
+    }
+    catch {
+        Write-Host "Could not write monitoring status to $MonitoringOutputPath : $($_.Exception.Message)" -ForegroundColor DarkYellow
+        Write-Log "WARN monitoring payload write failed: $($_.Exception.Message)"
     }
 }
 
@@ -235,6 +275,8 @@ Write-Host "`nStarting cleanup (cutoff: $($cutoff.ToString('yyyy-MM-dd HH:mm:ss'
 $wuauserv = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
 $wasRunning = $false
 $results = @()
+$rebootRequired = $false
+$dismExitCode = $null
 
 try {
     if ($wuauserv -and $wuauserv.Status -eq 'Running') {
@@ -280,9 +322,12 @@ try {
         try {
             $dism = Start-Process -FilePath 'dism.exe' -ArgumentList '/online /Cleanup-Image /StartComponentCleanup' -Wait -NoNewWindow -PassThru
             $knownSuccessCodes = @(0, 3010)
+            $dismExitCode = $dism.ExitCode
             if ($dism.ExitCode -in $knownSuccessCodes) {
                 if ($dism.ExitCode -eq 3010) {
+                    $rebootRequired = $true
                     Write-Host 'DISM completed and indicates a reboot is recommended (3010).' -ForegroundColor DarkYellow
+                    Write-Host 'Maintenance required: reboot to finalize component cleanup.' -ForegroundColor DarkYellow
                 }
                 Write-Log "DISM exit code: $($dism.ExitCode)"
             }
@@ -304,6 +349,7 @@ finally {
     }
 
     Flush-Log
+    Write-MonitoringStatus -RebootRequired:$rebootRequired -DismExitCode $dismExitCode
 }
 
 Write-Host "`nRe-checking disk space..." -ForegroundColor Cyan

@@ -21,6 +21,7 @@ A PowerShell script for **safe, high-impact cleanup** on Windows systems without
 - Optionally runs DISM component cleanup with explicit exit-code handling.
 - Automatically restores `wuauserv` service if it was running.
 - Optionally writes an audit log via `-LogPath`.
+- Optionally writes a monitoring status JSON via `-MonitoringOutputPath` (includes reboot-required signal).
 
 ## Improvements from previous version
 
@@ -30,6 +31,7 @@ A PowerShell script for **safe, high-impact cleanup** on Windows systems without
 - Added explicit DISM success handling for exit codes `0` and `3010`.
 - Reads crash dump location from registry instead of hardcoding `C:\Windows\MEMORY.DMP`.
 - Uses targeted error handling and keeps non-critical failures non-fatal.
+- Emits a machine-readable maintenance signal when DISM returns `3010` (reboot recommended).
 
 ## Requirements
 
@@ -53,6 +55,9 @@ A PowerShell script for **safe, high-impact cleanup** on Windows systems without
 
 # Enable empty directory removal + write an audit log
 .\DiskCleanup.ps1 -AutoMode -RemoveEmptyDirs -LogPath "C:\Logs\DiskCleanup.log"
+
+# Emit monitoring payload for SCOM/LogicMonitor ingestion
+.\DiskCleanup.ps1 -AutoMode -MonitoringOutputPath "C:\Logs\DiskCleanup.status.json"
 ```
 
 ## Suggested GitHub repo structure
@@ -85,6 +90,8 @@ Thumbs.db
 - The script does **not** run DISM `/ResetBase`.
 - Access-denied or in-use files are skipped as non-fatal.
 - Avoid `-RemoveEmptyDirs` unless you explicitly want directory pruning.
+- Cleaning `C:\Windows\Prefetch` can temporarily increase app start times while cache rebuilds.
+- If DISM returns `3010`, a reboot is recommended to fully finalize component cleanup.
 - For production systems, test in a staging/QA machine first.
 
 ## License

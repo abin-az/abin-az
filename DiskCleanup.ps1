@@ -9,6 +9,7 @@
     Key behavior:
     - Requires administrator privileges.
     - Deletes files older than a retention threshold.
+    - Expands wildcard target paths safely (for example user profile temp folders).
     - Skips missing paths and access errors safely.
     - Stops Windows Update service only when needed and restores it afterwards.
     - Optionally runs DISM component cleanup.
@@ -20,10 +21,17 @@
     Skip DISM component cleanup.
 .PARAMETER DriveLetter
     Drive letter for free-space reporting. Default: C.
+.PARAMETER RemoveEmptyDirs
+    Remove empty subdirectories after file cleanup.
+    Disabled by default to avoid deleting app-expected folder structures.
+.PARAMETER LogPath
+    Optional path for an audit log containing deleted and skipped entries.
 .EXAMPLE
     .\DiskCleanup.ps1 -AutoMode -Days 7
 .EXAMPLE
     .\DiskCleanup.ps1 -AutoMode -Days 30 -SkipDism
+.EXAMPLE
+    .\DiskCleanup.ps1 -WhatIf
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -36,11 +44,45 @@ param(
     [switch]$SkipDism,
 
     [ValidatePattern('^[A-Za-z]$')]
-    [string]$DriveLetter = 'C'
+    [string]$DriveLetter = 'C',
+
+    [switch]$RemoveEmptyDirs,
+
+    [string]$LogPath
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
+$script:LogEntries = [System.Collections.Generic.List[string]]::new()
+
+function Write-Log {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($LogPath)) {
+        return
+    }
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $script:LogEntries.Add("[$timestamp] $Message")
+}
+
+function Flush-Log {
+    if ([string]::IsNullOrWhiteSpace($LogPath)) {
+        return
+    }
+
+    try {
+        $folder = Split-Path -Path $LogPath -Parent
+        if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) {
+            New-Item -Path $folder -ItemType Directory -Force | Out-Null
+        }
+        $script:LogEntries | Out-File -LiteralPath $LogPath -Encoding UTF8 -Append
+        Write-Host "Log written to: $LogPath" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "Could not write log to $LogPath : $($_.Exception.Message)" -ForegroundColor DarkYellow
+    }
+}
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -50,8 +92,33 @@ function Test-IsAdministrator {
 
 function Get-FreeSpaceGb {
     param([string]$Letter)
-    $drive = Get-PSDrive -Name $Letter -ErrorAction Stop
+
+    $drive = Get-PSDrive -Name $Letter -ErrorAction SilentlyContinue
+    if (-not $drive) {
+        throw "Drive $Letter not found."
+    }
+
     return [math]::Round($drive.Free / 1GB, 2)
+}
+
+function Resolve-CleanupPaths {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    # Expand wildcard paths (e.g. C:\Users\*\AppData\Local\Temp)
+    if ($Path -match '[*?\[]') {
+        $resolved = Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName -Unique
+        return @($resolved)
+    }
+
+    if (Test-Path -LiteralPath $Path -PathType Container -ErrorAction SilentlyContinue) {
+        return @($Path)
+    }
+
+    return @()
 }
 
 function Clean-Path {
@@ -60,66 +127,85 @@ function Clean-Path {
         [string]$Path,
 
         [Parameter(Mandatory)]
-        [datetime]$CutoffDate
+        [datetime]$CutoffDate,
+
+        [switch]$DeleteEmptyDirs
     )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Container -ErrorAction SilentlyContinue)) {
-        Write-Host "Skipping missing path: $Path" -ForegroundColor DarkGray
+    $resolvedPaths = Resolve-CleanupPaths -Path $Path
+    if ($resolvedPaths.Count -eq 0) {
+        Write-Host "Skipping missing/unresolved path: $Path" -ForegroundColor DarkGray
+        Write-Log "SKIP path unresolved: $Path"
         return [pscustomobject]@{ Path = $Path; DeletedFiles = 0; Errors = 0 }
     }
-
-    Write-Host "Cleaning: $Path (older than $Days days)" -ForegroundColor Yellow
 
     $deleted = 0
     $errors = 0
 
-    try {
-        $files = Get-ChildItem -Path $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -lt $CutoffDate }
+    foreach ($resolvedPath in $resolvedPaths) {
+        Write-Host "Cleaning: $resolvedPath (older than $Days days)" -ForegroundColor Yellow
 
-        foreach ($file in $files) {
-            try {
-                if ($PSCmdlet.ShouldProcess($file.FullName, 'Delete file')) {
-                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-                    $deleted++
-                }
-            }
-            catch {
-                $errors++
-            }
-        }
+        try {
+            $files = Get-ChildItem -Path $resolvedPath -Recurse -File -Force -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $CutoffDate }
 
-        # Remove empty subdirectories to reduce clutter
-        Get-ChildItem -Path $Path -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-            Sort-Object FullName -Descending |
-            ForEach-Object {
+            foreach ($file in $files) {
                 try {
-                    $childCount = (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Measure-Object).Count
-                    if ($childCount -eq 0 -and $PSCmdlet.ShouldProcess($_.FullName, 'Delete empty directory')) {
-                        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                    if ($PSCmdlet.ShouldProcess($file.FullName, 'Delete file')) {
+                        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                        $deleted++
+                        Write-Log "DELETE file: $($file.FullName)"
                     }
                 }
                 catch {
                     $errors++
+                    Write-Log "ERROR deleting file: $($file.FullName) | $($_.Exception.Message)"
                 }
             }
-    }
-    catch {
-        Write-Host "Error while scanning $Path : $($_.Exception.Message)" -ForegroundColor Red
-        $errors++
+
+            if ($DeleteEmptyDirs) {
+                Get-ChildItem -Path $resolvedPath -Recurse -Directory -Force -ErrorAction SilentlyContinue |
+                    Sort-Object FullName -Descending |
+                    ForEach-Object {
+                        try {
+                            $childCount = (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+                            if ($childCount -eq 0 -and $PSCmdlet.ShouldProcess($_.FullName, 'Delete empty directory')) {
+                                Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop
+                                Write-Log "DELETE empty-dir: $($_.FullName)"
+                            }
+                        }
+                        catch {
+                            $errors++
+                            Write-Log "ERROR deleting empty-dir: $($_.FullName) | $($_.Exception.Message)"
+                        }
+                    }
+            }
+        }
+        catch {
+            Write-Host "Error while scanning $resolvedPath : $($_.Exception.Message)" -ForegroundColor Red
+            Write-Log "ERROR scanning path: $resolvedPath | $($_.Exception.Message)"
+            $errors++
+        }
     }
 
     return [pscustomobject]@{ Path = $Path; DeletedFiles = $deleted; Errors = $errors }
 }
 
-Write-Host "==== FAST DISK CLEANUP TOOL ====" -ForegroundColor Cyan
+Write-Host '==== FAST DISK CLEANUP TOOL ====' -ForegroundColor Cyan
 
 if (-not (Test-IsAdministrator)) {
     Write-Host 'Run this script as Administrator.' -ForegroundColor Red
     exit 1
 }
 
-$freeBefore = Get-FreeSpaceGb -Letter $DriveLetter
+try {
+    $freeBefore = Get-FreeSpaceGb -Letter $DriveLetter
+}
+catch {
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "`nFree space before cleanup ($DriveLetter): $freeBefore GB" -ForegroundColor Yellow
 
 $targets = @(
@@ -153,40 +239,61 @@ $results = @()
 try {
     if ($wuauserv -and $wuauserv.Status -eq 'Running') {
         Write-Host 'Stopping Windows Update service (wuauserv)...' -ForegroundColor Yellow
-        Stop-Service -Name wuauserv -Force -ErrorAction Stop
-        $wasRunning = $true
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
+            $wasRunning = $true
+        }
+        catch {
+            Write-Host 'Could not stop wuauserv; continuing cleanup.' -ForegroundColor DarkYellow
+            Write-Log "WARN unable to stop wuauserv: $($_.Exception.Message)"
+        }
     }
 
     foreach ($target in $targets) {
-        $results += Clean-Path -Path $target -CutoffDate $cutoff
+        $results += Clean-Path -Path $target -CutoffDate $cutoff -DeleteEmptyDirs:$RemoveEmptyDirs
     }
 
     Write-Host 'Clearing Recycle Bin...' -ForegroundColor Yellow
     try {
         Clear-RecycleBin -Force -ErrorAction Stop
+        Write-Log 'CLEAR recycle-bin: success'
     }
     catch {
         Write-Host 'Recycle Bin cleanup skipped due to access/availability.' -ForegroundColor DarkYellow
+        Write-Log "WARN recycle-bin cleanup skipped: $($_.Exception.Message)"
     }
 
-    Write-Host 'Removing MEMORY.DMP if present...' -ForegroundColor Yellow
-    try {
-        Remove-Item -LiteralPath 'C:\Windows\MEMORY.DMP' -Force -ErrorAction Stop
-    }
-    catch {
-        # No-op if missing or locked
+    $dumpPath = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\CrashControl' -Name 'DumpFile' -ErrorAction SilentlyContinue).DumpFile
+    if (-not [string]::IsNullOrWhiteSpace($dumpPath)) {
+        Write-Host "Removing crash dump file if present: $dumpPath" -ForegroundColor Yellow
+        try {
+            Remove-Item -LiteralPath $dumpPath -Force -ErrorAction Stop
+            Write-Log "DELETE dump-file: $dumpPath"
+        }
+        catch {
+            Write-Log "WARN unable to delete dump-file $dumpPath: $($_.Exception.Message)"
+        }
     }
 
     if (-not $SkipDism) {
         Write-Host 'Running DISM component cleanup (may take 5-15 minutes)...' -ForegroundColor Yellow
         try {
             $dism = Start-Process -FilePath 'dism.exe' -ArgumentList '/online /Cleanup-Image /StartComponentCleanup' -Wait -NoNewWindow -PassThru
-            if ($dism.ExitCode -ne 0) {
-                Write-Host "DISM completed with warnings (exit code: $($dism.ExitCode))." -ForegroundColor DarkYellow
+            $knownSuccessCodes = @(0, 3010)
+            if ($dism.ExitCode -in $knownSuccessCodes) {
+                if ($dism.ExitCode -eq 3010) {
+                    Write-Host 'DISM completed and indicates a reboot is recommended (3010).' -ForegroundColor DarkYellow
+                }
+                Write-Log "DISM exit code: $($dism.ExitCode)"
+            }
+            else {
+                Write-Host "DISM failed with exit code: $($dism.ExitCode)" -ForegroundColor Red
+                Write-Log "ERROR DISM exit code: $($dism.ExitCode)"
             }
         }
         catch {
             Write-Host 'DISM cleanup encountered an error. Continuing...' -ForegroundColor Red
+            Write-Log "ERROR DISM execution: $($_.Exception.Message)"
         }
     }
 }
@@ -195,6 +302,8 @@ finally {
         Write-Host 'Starting Windows Update service (wuauserv)...' -ForegroundColor Yellow
         Start-Service -Name wuauserv -ErrorAction SilentlyContinue
     }
+
+    Flush-Log
 }
 
 Write-Host "`nRe-checking disk space..." -ForegroundColor Cyan

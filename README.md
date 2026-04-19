@@ -12,25 +12,24 @@ A PowerShell script for **safe, high-impact cleanup** on Windows systems without
   - `C:\Windows\Temp`
   - `C:\Windows\SoftwareDistribution\Download`
   - `C:\Windows\Minidump`
-  - `C:\Users\*\AppData\Local\Temp`
+  - `C:\Users\*\AppData\Local\Temp` (expanded safely per-profile)
   - `C:\Windows\Prefetch`
   - `C:\inetpub\logs\LogFiles`
   - `C:\Windows\Logs\CBS`
 - Clears recycle bin.
-- Removes `C:\Windows\MEMORY.DMP` (if present).
-- Optionally runs DISM component cleanup.
+- Removes configured crash dump file path (from registry) if present.
+- Optionally runs DISM component cleanup with explicit exit-code handling.
 - Automatically restores `wuauserv` service if it was running.
+- Optionally writes an audit log via `-LogPath`.
 
-## Why this version is improved
+## Improvements from previous version
 
-Compared to the original pasted script, this rewrite adds:
-
-- Strict mode and safer error handling.
-- Parameter validation (`Days`, `DriveLetter`).
-- `-SkipDism` switch for faster runs.
-- Better service handling with `try/finally`.
-- Cleanup summary (deleted file count + non-fatal errors).
-- Duplicate-block issue removed (the original content appeared duplicated).
+- Fixed wildcard path handling so user temp folders are actually processed.
+- Empty directory deletion is now **opt-in** via `-RemoveEmptyDirs` (safer defaults).
+- Added resilient `wuauserv` stop behavior (warn and continue if stop fails).
+- Added explicit DISM success handling for exit codes `0` and `3010`.
+- Reads crash dump location from registry instead of hardcoding `C:\Windows\MEMORY.DMP`.
+- Uses targeted error handling and keeps non-critical failures non-fatal.
 
 ## Requirements
 
@@ -49,8 +48,11 @@ Compared to the original pasted script, this rewrite adds:
 # Automatic cleanup, skip DISM
 .\DiskCleanup.ps1 -AutoMode -Days 15 -SkipDism
 
-# Report/free-space on another drive letter
-.\DiskCleanup.ps1 -AutoMode -DriveLetter D
+# Dry run using ShouldProcess support
+.\DiskCleanup.ps1 -WhatIf
+
+# Enable empty directory removal + write an audit log
+.\DiskCleanup.ps1 -AutoMode -RemoveEmptyDirs -LogPath "C:\Logs\DiskCleanup.log"
 ```
 
 ## Suggested GitHub repo structure
@@ -80,8 +82,9 @@ Thumbs.db
 
 ## Safety notes
 
-- This script does **not** run `/ResetBase` with DISM.
+- The script does **not** run DISM `/ResetBase`.
 - Access-denied or in-use files are skipped as non-fatal.
+- Avoid `-RemoveEmptyDirs` unless you explicitly want directory pruning.
 - For production systems, test in a staging/QA machine first.
 
 ## License
